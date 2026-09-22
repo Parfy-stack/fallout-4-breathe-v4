@@ -1,0 +1,45 @@
+name: Build Respiration.dll
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Récupérer le plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Récupérer CommonLibF4 (version épinglée)
+        uses: actions/checkout@v4
+        with:
+          repository: Ryan-rsm-McKenzie/CommonLibF4
+          ref: 67173f8d44b9a928dbab983d25e576ac5f1e83ac
+          path: commonlibf4
+
+      - name: Configurer
+        shell: pwsh
+        run: |
+          cmake -S plugin -B plugin/build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+
+      - name: Compiler
+        shell: pwsh
+        run: cmake --build plugin/build --config Release
+
+      - name: Préparer l'archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/Data/F4SE/Plugins | Out-Null
+          Copy-Item plugin/build/Release/Respiration.dll dist/Data/F4SE/Plugins/
+          Copy-Item plugin/Data/F4SE/Plugins/Respiration.ini dist/Data/F4SE/Plugins/
+
+      - name: Publier
+        uses: actions/upload-artifact@v4
+        with:
+          name: Respiration
+          path: dist
