@@ -2,13 +2,17 @@
 
 #include "Breath.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 
 namespace
 {
@@ -50,6 +54,43 @@ namespace
 		g_config = std::move(cfg);
 	}
 
+	// Point de départ mémorisé pour la translation, par nom d'os : on déplace toujours
+	// depuis la position d'origine de l'os, jamais depuis sa position déplacée précédente.
+	std::unordered_map<const RE::NiAVObject*, RE::NiPoint3> g_restTranslation;
+
+	// Liste dans le log tous les os du squelette dont le nom laisse penser qu'ils sont
+	// autour du torse, pour aider à en choisir un sans deviner à l'aveugle.
+	void ListTorsoBones(RE::NiAVObject* a_node, int a_depth = 0)
+	{
+		if (!a_node) {
+			return;
+		}
+
+		static constexpr std::array<std::string_view, 9> keywords{
+			"belly"sv, "stomach"sv, "torso"sv, "spine"sv, "chest"sv,
+			"breast"sv, "com"sv, "pelvis"sv, "waist"sv
+		};
+
+		const std::string_view name = a_node->GetName();
+		std::string lower{ name };
+		std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+		for (const auto& kw : keywords) {
+			if (lower.find(kw) != std::string::npos) {
+				logger::info("os disponible : \"{}\"", name);
+				break;
+			}
+		}
+
+		if (auto* asNode = a_node->IsNode()) {
+			for (auto& child : asNode->children) {
+				if (child) {
+					ListTorsoBones(child.get(), a_depth + 1);
+				}
+			}
+		}
+	}
+
 	// Exécuté sur le thread principal du jeu (via la file de tâches de F4SE).
 	void Tick(const Respiration::Config& a_cfg)
 	{
@@ -57,6 +98,7 @@ namespace
 		static auto last = std::chrono::steady_clock::now();
 		static float debugTimer = 0.0f;
 		static bool loggedFound = false;
+		static bool listedBones = false;
 
 		const auto now = std::chrono::steady_clock::now();
 		const float dt = std::chrono::duration<float>(now - last).count();
@@ -64,6 +106,18 @@ namespace
 
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) {
+			return;
+		}
+
+		if (a_cfg.mode == Respiration::Mode::kListBones) {
+			if (!listedBones) {
+				listedBones = true;
+				if (auto* root = player->Get3D(false)) {
+					logger::info("--- os du torse détectés (3e personne) ---");
+					ListTorsoBones(root);
+					logger::info("--- fin de la liste : mets le nom voulu dans Bones= et remets Mode=Translate ---");
+				}
+			}
 			return;
 		}
 
@@ -78,7 +132,7 @@ namespace
 		const float maximum = owner->GetPermanentActorValue(*avs->actionPoints);
 		const float ratio = maximum > 1.0f ? std::clamp(current / maximum, 0.0f, 1.0f) : 1.0f;
 
-		const float scale = model.Step(a_cfg, dt, ratio);
+		const float wave = model.Step(a_cfg, dt, ratio);
 
 		// On applique aux squelettes 3e personne et 1re personne (le nœud peut ne pas exister dans le second).
 		std::size_t applied = 0;
@@ -89,9 +143,29 @@ namespace
 			}
 			for (const auto& bone : a_cfg.bones) {
 				const RE::BSFixedString name{ bone.c_str() };
-				if (auto* node = root->GetObjectByName(name)) {
-					node->local.scale = scale;
-					++applied;
+				auto* node = root->GetObjectByName(name);
+				if (!node) {
+					continue;
+				}
+				++applied;
+
+				if (a_cfg.mode == Respiration::Mode::kScale) {
+					const float amp = model.Blend(a_cfg.restAmplitude, a_cfg.exhaustedAmplitude);
+					node->local.scale = 1.0f + amp * wave;
+				} else {
+					auto [it, inserted] = g_restTranslation.try_emplace(node, node->local.translate);
+					if (inserted) {
+						continue;  // première frame vue : on mémorise juste la position de repos
+					}
+					const float amp = model.Blend(a_cfg.restTranslate, a_cfg.exhaustedTranslate);
+					RE::NiPoint3 offset = it->second;
+					const float delta = amp * wave;
+					switch (a_cfg.translateAxis) {
+					case 'x': offset.x += delta; break;
+					case 'z': offset.z += delta; break;
+					default: offset.y += delta; break;
+					}
+					node->local.translate = offset;
 				}
 			}
 		}
@@ -106,12 +180,12 @@ namespace
 			if (debugTimer >= 2.0f) {
 				debugTimer = 0.0f;
 				logger::info(
-					"AP {:.1f}/{:.1f} ratio {:.2f} période {:.2f}s échelle {:.4f} nœuds modifiés {}",
+					"AP {:.1f}/{:.1f} ratio {:.2f} période {:.2f}s onde {:.3f} nœuds modifiés {}",
 					current,
 					maximum,
 					ratio,
 					model.Period(),
-					scale,
+					wave,
 					applied);
 			}
 		}

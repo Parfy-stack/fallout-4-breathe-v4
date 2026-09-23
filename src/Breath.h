@@ -11,15 +11,32 @@
 
 namespace Respiration
 {
+	enum class Mode
+	{
+		kScale,       // gonfle l'os dans les 3 axes (effet "ballon")
+		kTranslate,   // déplace l'os le long d'un axe (effet plus naturel)
+		kListBones,   // ne modifie rien : liste les os disponibles dans le log au démarrage
+	};
+
 	struct Config
 	{
 		bool enabled{ true };
 		bool debug{ false };
+		Mode mode{ Mode::kTranslate };
 		std::vector<std::string> bones{ "Belly_skin" };
 		float restPeriod{ 4.0f };           // secondes par respiration, reposé
 		float exhaustedPeriod{ 1.0f };      // secondes par respiration, à bout de souffle
-		float restAmplitude{ 0.015f };      // variation d'échelle de l'os, reposé
-		float exhaustedAmplitude{ 0.05f };  // variation d'échelle de l'os, à bout de souffle
+
+		// Mode kScale : variation d'échelle de l'os (0.015 = ±1.5%)
+		float restAmplitude{ 0.015f };
+		float exhaustedAmplitude{ 0.05f };
+
+		// Mode kTranslate : déplacement le long des axes locaux de l'os, en unités du jeu
+		// (le squelette Fallout 4 est à l'échelle ~1 unité = ~1.4 cm)
+		char translateAxis{ 'y' };          // 'x', 'y' ou 'z' : dépend de l'orientation de l'os choisi
+		float restTranslate{ 0.15f };
+		float exhaustedTranslate{ 0.5f };
+
 		float smoothing{ 2.0f };            // vitesse de lissage (plus grand = plus réactif)
 	};
 
@@ -92,6 +109,15 @@ namespace Respiration
 					cfg.enabled = ParseBool(value);
 				} else if (key == "debug") {
 					cfg.debug = ParseBool(value);
+				} else if (key == "mode") {
+					const auto v = Lower(value);
+					if (v == "scale") {
+						cfg.mode = Mode::kScale;
+					} else if (v == "translate") {
+						cfg.mode = Mode::kTranslate;
+					} else if (v == "listbones") {
+						cfg.mode = Mode::kListBones;
+					}
 				} else if (key == "bones") {
 					if (auto bones = SplitBones(value); !bones.empty()) {
 						cfg.bones = std::move(bones);
@@ -104,6 +130,15 @@ namespace Respiration
 					cfg.restAmplitude = std::stof(value);
 				} else if (key == "exhaustedamplitude") {
 					cfg.exhaustedAmplitude = std::stof(value);
+				} else if (key == "translateaxis") {
+					const auto v = Lower(value);
+					if (!v.empty() && (v[0] == 'x' || v[0] == 'y' || v[0] == 'z')) {
+						cfg.translateAxis = v[0];
+					}
+				} else if (key == "resttranslate") {
+					cfg.restTranslate = std::stof(value);
+				} else if (key == "exhaustedtranslate") {
+					cfg.exhaustedTranslate = std::stof(value);
 				} else if (key == "smoothing") {
 					cfg.smoothing = std::stof(value);
 				}
@@ -120,45 +155,52 @@ namespace Respiration
 		return cfg;
 	}
 
-	// Modèle de respiration : période et amplitude suivent l'essoufflement, avec lissage.
+	// Modèle de respiration : période suit l'essoufflement, avec lissage.
+	// Ne connaît rien au mode d'application (échelle ou translation) : il fournit
+	// une onde 0..1 (0 = poumons vides, 1 = poumons pleins) et l'effort courant lissé,
+	// à charge pour l'appelant d'en tirer une échelle, une translation, etc.
 	class BreathModel
 	{
 	public:
-		// a_staminaRatio : 1.0 = pleine endurance, 0.0 = vide. Retourne l'échelle à appliquer à l'os.
+		// a_staminaRatio : 1.0 = pleine endurance, 0.0 = vide. Retourne l'onde de respiration (0..1).
 		float Step(const Config& a_cfg, float a_dt, float a_staminaRatio)
 		{
 			const float dt = std::clamp(a_dt, 0.0f, 0.25f);
 			const float ratio = std::clamp(a_staminaRatio, 0.0f, 1.0f);
-			const float effort = 1.0f - ratio;  // 0 = reposé, 1 = épuisé
+			const float targetEffort = 1.0f - ratio;  // 0 = reposé, 1 = épuisé
 
-			const float targetPeriod = a_cfg.restPeriod + (a_cfg.exhaustedPeriod - a_cfg.restPeriod) * effort;
-			const float targetAmplitude = a_cfg.restAmplitude + (a_cfg.exhaustedAmplitude - a_cfg.restAmplitude) * effort;
+			const float targetPeriod = a_cfg.restPeriod + (a_cfg.exhaustedPeriod - a_cfg.restPeriod) * targetEffort;
 
 			if (!_initialized) {
 				_period = targetPeriod;
-				_amplitude = targetAmplitude;
+				_effort = targetEffort;
 				_initialized = true;
 			}
 
 			const float blend = 1.0f - std::exp(-a_cfg.smoothing * dt);
 			_period += (targetPeriod - _period) * blend;
-			_amplitude += (targetAmplitude - _amplitude) * blend;
+			_effort += (targetEffort - _effort) * blend;
 
 			_phase += dt / std::max(_period, 0.2f);
 			_phase -= std::floor(_phase);
 
 			constexpr float twoPi = 6.28318530718f;
-			const float wave = 0.5f - 0.5f * std::cos(_phase * twoPi);  // 0..1
-			return 1.0f + _amplitude * wave;
+			return 0.5f - 0.5f * std::cos(_phase * twoPi);  // 0..1
+		}
+
+		// Interpole une paire (valeur au repos, valeur à bout de souffle) selon l'effort lissé courant.
+		[[nodiscard]] float Blend(float a_rest, float a_exhausted) const noexcept
+		{
+			return a_rest + (a_exhausted - a_rest) * _effort;
 		}
 
 		[[nodiscard]] float Period() const noexcept { return _period; }
-		[[nodiscard]] float Amplitude() const noexcept { return _amplitude; }
+		[[nodiscard]] float Effort() const noexcept { return _effort; }
 
 	private:
 		bool _initialized{ false };
 		float _phase{ 0.0f };
 		float _period{ 4.0f };
-		float _amplitude{ 0.015f };
+		float _effort{ 0.0f };
 	};
 }
